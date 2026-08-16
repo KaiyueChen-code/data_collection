@@ -48,6 +48,10 @@ class DataConvertConfig:
     raw_data_dir: str = RAW_DATA_DIR
     selected_data_dir: str = SELECTED_DATA_DIR
     episodes_per_chunk: int = 50
+    # 沿用旧版稳定的 LeRobot 图像写入配置。
+    image_writer_threads: int = 10
+    image_writer_processes: int = 5
+    lerobot_jpeg_quality: int = 94
 
     visual_out_res: tuple[int, int] = (224, 224)
     tactile_out_res: tuple[int, int] = (224, 224)

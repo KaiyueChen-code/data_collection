@@ -6,6 +6,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import os
@@ -13,13 +14,13 @@ import re
 import csv
 import pickle
 import shutil
-import tempfile
 from pathlib import Path
 from collections import defaultdict
 from typing import Optional
 
 import numpy as np
 import cv2
+import PIL.Image
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
@@ -44,6 +45,46 @@ from utils.cv_util import (
 )
 
 
+def _patch_lerobot_jpeg_frame_writer(quality: int) -> None:
+    """沿用旧版逻辑：将 LeRobot 临时帧写成 JPEG 后嵌入 Parquet。"""
+    if quality < 1 or quality > 100:
+        return
+
+    import lerobot.common.datasets.image_writer as lerobot_iw
+    import lerobot.common.datasets.lerobot_dataset as lerobot_ld
+    import lerobot.common.datasets.utils as lerobot_utils
+
+    jpg_path = (
+        "images/{image_key}/episode_{episode_index:06d}/"
+        "frame_{frame_index:06d}.jpg"
+    )
+    lerobot_utils.DEFAULT_IMAGE_PATH = jpg_path
+    lerobot_ld.DEFAULT_IMAGE_PATH = jpg_path
+
+    def write_image_jpeg(image, fpath: Path) -> None:
+        try:
+            if isinstance(image, np.ndarray):
+                img = lerobot_iw.image_array_to_pil_image(image)
+            elif isinstance(image, PIL.Image.Image):
+                img = image
+            else:
+                raise TypeError(f"Unsupported image type: {type(image)}")
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(
+                fpath,
+                format="JPEG",
+                quality=int(quality),
+                optimize=False,
+                subsampling=2,
+            )
+        except Exception as exc:
+            print(f"Error writing JPEG image {fpath}: {exc}")
+
+    lerobot_iw.write_image = write_image_jpeg
+    lerobot_ld.write_image = write_image_jpeg
+
+
 # ============================================================================
 # LeRobot 输出格式映射
 # ============================================================================
@@ -55,6 +96,20 @@ IMAGE_KEYS = [
     ("camera1_left_tactile", "observation.images.tactile_left_1"),
     ("camera1_right_tactile", "observation.images.tactile_right_1"),
 ]
+
+RESUME_FORMAT_VERSION = 1
+DERIVED_IMAGE_DIR_SUFFIXES = (
+    "_hand_visual_img",
+    "_hand_left_tactile_img",
+    "_hand_right_tactile_img",
+)
+DERIVED_INPUT_FILENAMES = {
+    "dataset_plan.pkl",
+    "tag_detection_left.pkl",
+    "tag_detection_right.pkl",
+    "gripper_width_left.csv",
+    "gripper_width_right.csv",
+}
 
 
 def _process_image(img, target_h=224, target_w=224):
@@ -442,6 +497,188 @@ def _save_jsonl(path: Path, rows: list[dict]) -> None:
             file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _save_json_atomic(path: Path, payload: dict) -> None:
+    """Write a JSON marker atomically so an interruption cannot half-write it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    with temporary_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temporary_path, path)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _source_inputs_sha256(input_path: Path) -> str:
+    """Fingerprint original inputs without hashing large image contents.
+
+    Generated images/tag results are excluded because they are deterministically
+    recreated by steps 01-04. Their producing code and dataset_plan are hashed
+    separately. Original file path, size and mtime catch source-data changes.
+    """
+    digest = hashlib.sha256()
+    for current_root, dirnames, filenames in os.walk(input_path):
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not name.endswith(DERIVED_IMAGE_DIR_SUFFIXES)
+        )
+        root_path = Path(current_root)
+        for filename in sorted(filenames):
+            if filename in DERIVED_INPUT_FILENAMES:
+                continue
+            path = root_path / filename
+            relative = path.relative_to(input_path)
+            stat = path.stat()
+            digest.update(relative.as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _resume_spec(
+    *,
+    input_path: Path,
+    plan_path: Path,
+    settings: dict,
+) -> dict:
+    code_paths = [
+        Path(__file__).resolve(),
+        PROJECT_ROOT / "data_collection" / "pipeline" / "01_crop_img.py",
+        PROJECT_ROOT / "data_collection" / "pipeline" / "02_get_aruco_pos.py",
+        PROJECT_ROOT / "data_collection" / "pipeline" / "03_get_width.py",
+        PROJECT_ROOT / "data_collection" / "pipeline" / "04_generate_dataset_plan.py",
+        PROJECT_ROOT / "utils" / "cv_util.py",
+        PROJECT_ROOT / "utils" / "pose_util.py",
+    ]
+    payload = {
+        "format_version": RESUME_FORMAT_VERSION,
+        "settings": settings,
+        "dataset_plan_sha256": _sha256_file(plan_path),
+        "source_inputs_sha256": _source_inputs_sha256(input_path),
+        "code_sha256": {
+            str(path.relative_to(PROJECT_ROOT)): _sha256_file(path)
+            for path in code_paths
+        },
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["fingerprint"] = hashlib.sha256(canonical).hexdigest()
+    return payload
+
+
+def _prepare_resume_root(resume_root: Path, spec: dict) -> None:
+    manifest_path = resume_root / "resume_manifest.json"
+    if manifest_path.exists():
+        existing = _load_json(manifest_path)
+        if existing.get("fingerprint") != spec["fingerprint"]:
+            raise RuntimeError(
+                "Existing resume chunks do not match the current source data, "
+                f"pipeline code, or conversion settings: {resume_root}\n"
+                "Move this directory aside to keep it, or remove it to restart."
+            )
+        return
+
+    if resume_root.exists() and any(resume_root.iterdir()):
+        raise RuntimeError(
+            f"Resume directory has no valid manifest and cannot be reused safely: {resume_root}"
+        )
+    resume_root.mkdir(parents=True, exist_ok=True)
+    _save_json_atomic(manifest_path, spec)
+
+
+def _chunk_marker_path(resume_root: Path, chunk_index: int) -> Path:
+    return resume_root / f"chunk_{chunk_index:04d}.complete.json"
+
+
+def _validate_completed_chunk(
+    *,
+    resume_root: Path,
+    chunk_index: int,
+    chunk_start: int,
+    chunk_end: int,
+    fingerprint: str,
+) -> dict | None:
+    marker_path = _chunk_marker_path(resume_root, chunk_index)
+    if not marker_path.exists():
+        return None
+
+    try:
+        marker = _load_json(marker_path)
+        expected = {
+            "fingerprint": fingerprint,
+            "chunk_index": chunk_index,
+            "source_episode_start": chunk_start,
+            "source_episode_end": chunk_end,
+        }
+        if any(marker.get(key) != value for key, value in expected.items()):
+            return None
+
+        converted_episodes = int(marker["converted_episodes"])
+        total_frames = int(marker["total_frames"])
+        if not 0 <= converted_episodes <= chunk_end - chunk_start:
+            return None
+        if total_frames < 0:
+            return None
+
+        chunk_dir = resume_root / f"chunk_{chunk_index:04d}"
+        if converted_episodes == 0:
+            return None
+        if not chunk_dir.is_dir():
+            return None
+
+        required_files = [
+            chunk_dir / "meta" / "info.json",
+            chunk_dir / "meta" / "tasks.jsonl",
+            chunk_dir / "meta" / "episodes.jsonl",
+        ]
+        if any(not path.is_file() for path in required_files):
+            return None
+
+        episodes = _load_jsonl(chunk_dir / "meta" / "episodes.jsonl")
+        if len(episodes) != converted_episodes:
+            return None
+        episode_indices = {int(row["episode_index"]) for row in episodes}
+        parquet_indices = {
+            int(path.stem.split("_")[-1])
+            for path in chunk_dir.glob("data/chunk-*/episode_*.parquet")
+        }
+        if episode_indices != parquet_indices:
+            return None
+        if sum(int(row.get("length", 0)) for row in episodes) != total_frames:
+            return None
+
+        info = _load_json(chunk_dir / "meta" / "info.json")
+        if info.get("total_episodes") not in (None, converted_episodes):
+            return None
+        return marker
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _discard_incomplete_chunk(resume_root: Path, chunk_index: int) -> None:
+    chunk_dir = resume_root / f"chunk_{chunk_index:04d}"
+    marker_path = _chunk_marker_path(resume_root, chunk_index)
+    if chunk_dir.exists():
+        shutil.rmtree(chunk_dir)
+    if marker_path.exists():
+        marker_path.unlink()
+
+
 def _set_table_column(table: pa.Table, name: str, values) -> pa.Table:
     if name not in table.column_names:
         return table
@@ -633,6 +870,24 @@ def main():
         action="store_true",
         help="合并成功后保留临时 chunk 数据集",
     )
+    parser.add_argument(
+        "--image_writer_threads",
+        type=int,
+        default=10,
+        help="LeRobot 图像写入线程数（沿用旧版默认值 10）",
+    )
+    parser.add_argument(
+        "--image_writer_processes",
+        type=int,
+        default=5,
+        help="LeRobot 图像写入子进程数（沿用旧版默认值 5）",
+    )
+    parser.add_argument(
+        "--lerobot-jpeg-quality",
+        type=int,
+        default=94,
+        help="1-100 使用旧版 JPEG 写入；0 使用 LeRobot 默认 PNG",
+    )
     # ---- Conversion settings ----
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--language_instruction", type=str, nargs="+", default=None)
@@ -661,6 +916,21 @@ def main():
         raise ValueError("task_name must be a single directory name")
     if args.episodes_per_chunk <= 0:
         raise ValueError("episodes_per_chunk must be greater than zero")
+    if args.image_writer_threads <= 0:
+        raise ValueError("image_writer_threads must be greater than zero")
+    if args.image_writer_processes <= 0:
+        raise ValueError("image_writer_processes must be greater than zero")
+    if not 0 <= args.lerobot_jpeg_quality <= 100:
+        raise ValueError("lerobot_jpeg_quality must be between 0 and 100")
+
+    if args.lerobot_jpeg_quality > 0:
+        _patch_lerobot_jpeg_frame_writer(args.lerobot_jpeg_quality)
+        print(
+            "LeRobot 临时帧使用旧版 JPEG 写入: "
+            f"quality={args.lerobot_jpeg_quality}（.jpg -> Parquet）"
+        )
+    else:
+        print("LeRobot 临时帧使用库默认 PNG")
 
     raw_data_dir = _resolve_project_path(args.raw_data_dir)
     selected_data_dir = _resolve_project_path(args.selected_data_dir)
@@ -726,6 +996,10 @@ def main():
     print(f"临时 chunk: 每 {args.episodes_per_chunk} episodes 一个")
     print(f"Episodes: {len(plan)}, Robots: {num_robots}, Cameras: {num_cameras}")
     print(f"state_dim={state_dim}, action_dim={action_dim}")
+    print(
+        f"image_writer_threads={args.image_writer_threads}, "
+        f"image_writer_processes={args.image_writer_processes}"
+    )
     print(f"{'='*60}\n")
 
     if final_output_path.exists():
@@ -733,7 +1007,6 @@ def main():
     selected_data_dir.mkdir(parents=True, exist_ok=True)
     chunks_parent = selected_data_dir / ".chunks"
     chunks_parent.mkdir(parents=True, exist_ok=True)
-    temporary_root = Path(tempfile.mkdtemp(prefix=f"{task_name}_", dir=chunks_parent))
 
     features = {
         **{
@@ -756,6 +1029,44 @@ def main():
         },
     }
 
+    resume_root = chunks_parent / f"{task_name}_resume"
+    resume_settings = {
+        "task_name": task_name,
+        "input_path": str(input_path),
+        "output_repo_id": output_repo_id,
+        "episodes_per_chunk": args.episodes_per_chunk,
+        "image_writer_threads": args.image_writer_threads,
+        "image_writer_processes": args.image_writer_processes,
+        "lerobot_jpeg_quality": args.lerobot_jpeg_quality,
+        "fps": args.fps,
+        "language_instruction": language_instruction,
+        "single_arm": args.single_arm,
+        "smooth_sigma": args.smooth_sigma,
+        "no_state": args.no_state,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "use_tactile_img": use_tactile_img,
+        "use_mask": use_mask,
+        "fisheye_mask_params": fisheye_mask_params,
+        "use_inpaint_tag": use_inpaint_tag,
+        "tag_scale": tag_scale,
+        "visual_out_res": visual_out_res,
+        "tactile_out_res": tactile_out_res,
+        "features": features,
+    }
+    print("检查断点续传信息 ...")
+    resume_spec = _resume_spec(
+        input_path=input_path,
+        plan_path=plan_path,
+        settings=resume_settings,
+    )
+    _prepare_resume_root(resume_root, resume_spec)
+    print(f"断点目录: {resume_root}")
+
+    kept_chunks = chunks_parent / f"{task_name}_chunks"
+    if args.keep_chunks and kept_chunks.exists():
+        raise FileExistsError(f"临时 chunk 保留目录已存在: {kept_chunks}")
+
     chunk_dirs: list[Path] = []
     total_frames = 0
     converted_episodes = 0
@@ -766,8 +1077,34 @@ def main():
             range(0, len(plan), args.episodes_per_chunk)
         ):
             chunk_end = min(chunk_start + args.episodes_per_chunk, len(plan))
-            chunk_dir = temporary_root / f"chunk_{chunk_index:04d}"
+            chunk_dir = resume_root / f"chunk_{chunk_index:04d}"
             chunk_repo_id = f"{output_repo_id}_chunk_{chunk_index:04d}"
+
+            completed = _validate_completed_chunk(
+                resume_root=resume_root,
+                chunk_index=chunk_index,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                fingerprint=resume_spec["fingerprint"],
+            )
+            if completed is not None:
+                chunk_episode_count = int(completed["converted_episodes"])
+                chunk_frame_count = int(completed["total_frames"])
+                converted_episodes += chunk_episode_count
+                total_frames += chunk_frame_count
+                if chunk_episode_count:
+                    chunk_dirs.append(chunk_dir)
+                print(
+                    f"\n[Resume {chunk_index + 1}/{total_chunks}] "
+                    f"skip completed chunk: episodes {chunk_start}..{chunk_end - 1} "
+                    f"({chunk_episode_count} converted, {chunk_frame_count} frames)"
+                )
+                continue
+
+            if chunk_dir.exists() or _chunk_marker_path(resume_root, chunk_index).exists():
+                print(f"\n[Resume] rebuilding incomplete chunk {chunk_index:04d}")
+                _discard_incomplete_chunk(resume_root, chunk_index)
+
             print(
                 f"\n[Chunk {chunk_index + 1}/{total_chunks}] "
                 f"episodes {chunk_start}..{chunk_end - 1}"
@@ -780,10 +1117,11 @@ def main():
                 robot_type="single_arm" if args.single_arm else "bimanual",
                 features=features,
                 use_videos=False,
-                image_writer_threads=10,
-                image_writer_processes=5,
+                image_writer_threads=max(1, args.image_writer_threads),
+                image_writer_processes=max(1, args.image_writer_processes),
             )
             chunk_episode_count = 0
+            chunk_frame_count = 0
             try:
                 chunk_plan = plan[chunk_start:chunk_end]
                 for local_offset, plan_episode in enumerate(
@@ -823,34 +1161,53 @@ def main():
                     dataset.save_episode()
                     chunk_episode_count += 1
                     converted_episodes += 1
+                    chunk_frame_count += len(frames)
                     total_frames += len(frames)
             finally:
                 dataset.stop_image_writer()
 
             if chunk_episode_count:
                 chunk_dirs.append(chunk_dir)
+                _save_json_atomic(
+                    _chunk_marker_path(resume_root, chunk_index),
+                    {
+                        "fingerprint": resume_spec["fingerprint"],
+                        "chunk_index": chunk_index,
+                        "source_episode_start": chunk_start,
+                        "source_episode_end": chunk_end,
+                        "converted_episodes": chunk_episode_count,
+                        "total_frames": chunk_frame_count,
+                    },
+                )
+                print(
+                    f"[Chunk {chunk_index + 1}/{total_chunks}] complete marker saved "
+                    f"({chunk_episode_count} converted, {chunk_frame_count} frames)"
+                )
             else:
                 shutil.rmtree(chunk_dir)
+                print(
+                    f"[Chunk {chunk_index + 1}/{total_chunks}] no episodes converted; "
+                    "no completion marker saved"
+                )
 
         if not chunk_dirs:
             raise RuntimeError("所有 episode 转换失败，没有可合并的 chunk")
 
-        kept_chunks = chunks_parent / f"{task_name}_chunks"
-        if args.keep_chunks and kept_chunks.exists():
-            raise FileExistsError(f"临时 chunk 保留目录已存在: {kept_chunks}")
-
-        merge_stage = temporary_root / "merged"
+        merge_stage = resume_root / "merged"
+        if merge_stage.exists():
+            print(f"删除上次未完成的合并目录: {merge_stage}")
+            shutil.rmtree(merge_stage)
         print(f"\n正在合并 {len(chunk_dirs)} 个 chunk ...")
         merge_lerobot_chunks(chunk_dirs, merge_stage)
         merge_stage.rename(final_output_path)
 
         if args.keep_chunks:
-            temporary_root.rename(kept_chunks)
+            resume_root.rename(kept_chunks)
             print(f"临时 chunks 已保留: {kept_chunks}")
         else:
-            shutil.rmtree(temporary_root)
-    except Exception:
-        print(f"转换未完成，临时数据保留在: {temporary_root}")
+            shutil.rmtree(resume_root)
+    except (Exception, KeyboardInterrupt):
+        print(f"转换未完成，断点数据保留在: {resume_root}")
         raise
 
     print(f"\n{'='*60}")

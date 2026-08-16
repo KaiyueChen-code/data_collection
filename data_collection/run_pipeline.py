@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import subprocess
@@ -75,6 +76,9 @@ def build_cmd_for_step(step_name, step_path, cfg):
             "--raw_data_dir", cfg.raw_data_dir,
             "--selected_data_dir", cfg.selected_data_dir,
             "--episodes_per_chunk", str(cfg.episodes_per_chunk),
+            "--image_writer_threads", str(cfg.image_writer_threads),
+            "--image_writer_processes", str(cfg.image_writer_processes),
+            "--lerobot-jpeg-quality", str(cfg.lerobot_jpeg_quality),
             "--fps", str(cfg.fps),
             "--smooth_sigma", str(cfg.smooth_sigma),
             "--tag_scale", str(cfg.tag_scale),
@@ -108,7 +112,7 @@ def build_cmd_for_step(step_name, step_path, cfg):
     raise ValueError(f"Unknown step: {step_name}")
 
 
-def run_pipeline():
+def run_pipeline(only_step: str | None = None):
     cfg = DATA_CONVERT_CONFIG
     pipeline_dir = work_dir / "pipeline"
 
@@ -133,6 +137,8 @@ def run_pipeline():
         "04_generate_dataset_plan.py",
         "05_convert_raw_to_lerobot.py",
     ]
+    if only_step is not None:
+        pipeline_steps = [only_step]
 
     for step_name in pipeline_steps:
         step_path = pipeline_dir / step_name
@@ -166,4 +172,19 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser(description="Run the data processing pipeline")
+    parser.add_argument(
+        "--only",
+        choices=["01", "02", "03", "04", "05"],
+        default=None,
+        help="Run only one pipeline step, for example --only 05 to resume conversion",
+    )
+    cli_args = parser.parse_args()
+    step_by_number = {
+        "01": "01_crop_img.py",
+        "02": "02_get_aruco_pos.py",
+        "03": "03_get_width.py",
+        "04": "04_generate_dataset_plan.py",
+        "05": "05_convert_raw_to_lerobot.py",
+    }
+    run_pipeline(step_by_number.get(cli_args.only))
