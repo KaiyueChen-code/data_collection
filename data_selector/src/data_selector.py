@@ -242,7 +242,7 @@ def render_timeseries(df: pd.DataFrame, frame_idx: int,
                                 ['X', 'Y', 'Z'], ['#FF6B6B', '#4ECDC4', '#45B7D1'],
                                 grip0, 'R0 Grip', '#FFD93D'))
     if states is not None and states.shape[1] >= 17:
-        cols_available.append(('R1 EEF + Gripper', states[:, 14:17],
+        cols_available.append(('R1 EEF + Gripper', states[:, 7:10],
                                 ['X', 'Y', 'Z'], ['#FF6B6B', '#4ECDC4', '#45B7D1'],
                                 grip1, 'R1 Grip', '#6BCB77'))
 

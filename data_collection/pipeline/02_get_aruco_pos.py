@@ -32,10 +32,10 @@ def find_demos_with_images(demos_dir: Path, task_type: str, single_hand_side: st
             continue
         
         if task_type == "single":
-            if (demo_dir / f'{single_hand_side}_hand_visual_img').exists():
+            if (demo_dir / f'{single_hand_side}_hand_img').exists():
                 demo_dirs.append(demo_dir)
         else:
-            if (demo_dir / 'left_hand_visual_img').exists() or (demo_dir / 'right_hand_visual_img').exists():
+            if (demo_dir / 'left_hand_img').exists() or (demo_dir / 'right_hand_img').exists():
                 demo_dirs.append(demo_dir)
     
     return sorted(demo_dirs)
@@ -45,7 +45,7 @@ def create_detection_tasks(demo_dirs, task_type, single_hand_side, intrinsics, a
     
     for demo_dir in demo_dirs:
         if task_type == "single":
-            img_folder = demo_dir / f'{single_hand_side}_hand_visual_img'
+            img_folder = demo_dir / f'{single_hand_side}_hand_img'
             if img_folder.exists():
                 tasks.append({
                     'input': str(img_folder),
@@ -58,7 +58,7 @@ def create_detection_tasks(demo_dirs, task_type, single_hand_side, intrinsics, a
                 })
         else:
             for hand in ['left', 'right']:
-                img_folder = demo_dir / f'{hand}_hand_visual_img'
+                img_folder = demo_dir / f'{hand}_hand_img'
                 if img_folder.exists():
                     tasks.append({
                         'input': str(img_folder),
@@ -101,7 +101,13 @@ def process_video_detection(task, num_workers):
         first_img = cv2.imread(str(img_files[0]))
         if first_img is None:
             return False, f"Failed to read first image: {img_files[0]}"
-        
+
+        h, w = first_img.shape[:2]
+        if w >= 3:
+            first_img = first_img[:, w // 3: 2 * w // 3]
+        else:
+            return False, f"Unexpected image width for visual crop: {w}"
+
         h, w = first_img.shape[:2]
         in_res = np.array([h, w])[::-1]
         fisheye_intr = convert_fisheye_intrinsics_resolution(
@@ -125,6 +131,13 @@ def process_video_detection(task, num_workers):
             img_bgr = cv2.imread(str(img_file))
             if img_bgr is None:
                 continue
+            # Old stable path: detect on the full-resolution center visual
+            # panel from [left_tactile | visual | right_tactile].
+            iw = img_bgr.shape[1]
+            if iw >= 3:
+                img_bgr = img_bgr[:, iw // 3: 2 * iw // 3]
+            else:
+                continue
             img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             
             tag_dict = detect_localize_aruco_tags(
@@ -140,7 +153,8 @@ def process_video_detection(task, num_workers):
             result = {
                 'frame_idx': i,
                 'time': time_val,
-                'tag_dict': tag_dict
+                'tag_dict': tag_dict,
+                'det_image_size': [int(w), int(h)],
             }
             # # HACK: for debug
             # if len(tag_dict) < 2:

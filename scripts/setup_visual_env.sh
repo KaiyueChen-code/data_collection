@@ -118,8 +118,12 @@ if [[ "${INSTALL_SYSTEM_DEPS}" -eq 1 ]]; then
     fi
 fi
 
-echo "Creating visual environment: ${ENV_DIR}"
-"${PYTHON_BIN}" -m venv "${ENV_DIR}"
+if [[ -x "${ENV_DIR}/bin/python" ]]; then
+    echo "Updating existing visual environment: ${ENV_DIR}"
+else
+    echo "Creating visual environment: ${ENV_DIR}"
+    "${PYTHON_BIN}" -m venv "${ENV_DIR}"
+fi
 echo "Using PyPI mirror: ${PYPI_INDEX_URL}"
 "${ENV_DIR}/bin/python" -m pip config --site set global.index-url "${PYPI_INDEX_URL}"
 "${ENV_DIR}/bin/python" -m pip config --site set global.timeout "${PIP_DOWNLOAD_TIMEOUT}"
