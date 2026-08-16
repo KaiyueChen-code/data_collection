@@ -15,6 +15,8 @@ PROJECT_ROOT = SCRIPT_DIR.parents[1]
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
 sys.path.append(str(PROJECT_ROOT))
 
+from utils.cv_util import resize_center_crop
+
 
 def find_demos_with_images(demos_dir: Path, task_type: str, single_hand_side: str):
     """Find all demo directories that have image folders."""
@@ -120,12 +122,10 @@ def crop_images_for_hand(demo_dir: Path, hand: str,
         visual_final = visual
         right_tactile_final = right_tactile
 
-        # Resize to target resolution
-        vw, vh = visual_out_res
-        tw, th = tactile_out_res
-        visual_final = cv2.resize(visual_final, (vw, vh))
-        left_tactile_final = cv2.resize(left_tactile_final, (tw, th))
-        right_tactile_final = cv2.resize(right_tactile_final, (tw, th))
+        # Method A: preserve aspect ratio, resize, then center crop.
+        visual_final = resize_center_crop(visual_final, visual_out_res)
+        left_tactile_final = resize_center_crop(left_tactile_final, tactile_out_res)
+        right_tactile_final = resize_center_crop(right_tactile_final, tactile_out_res)
 
         # Save cropped images with the same filename
         left_tactile_path = left_tactile_dir / img_path.name
@@ -181,6 +181,7 @@ def main(task_name: str, task_type: str, single_hand_side: str = "left",
         print(f"[INFO] Processing both left and right hands")
     print(f"[INFO] Total tasks: {len(tasks)}")
     print(f"[INFO] Output resolution: visual={visual_out_res}, tactile={tactile_out_res}")
+    print("[INFO] Resize mode: A (aspect-preserving resize + center crop)")
 
     # Set default number of workers
     if num_workers is None:

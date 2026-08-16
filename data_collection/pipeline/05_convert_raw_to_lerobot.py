@@ -38,6 +38,7 @@ from utils.config_utils import get_mandatory_config
 from utils.cv_util import (
     get_fisheye_image_transform,
     get_tactile_image_transform,
+    resize_center_crop,
     inpaint_tag,
     draw_fisheye_mask,
 )
@@ -68,7 +69,7 @@ def _process_image(img, target_h=224, target_w=224):
         else:
             img = img.astype(np.uint8)
     try:
-        return cv2.resize(img, (target_w, target_h))
+        return resize_center_crop(img, (target_w, target_h))
     except Exception:
         return np.zeros((target_h, target_w, 3), dtype=np.uint8)
 

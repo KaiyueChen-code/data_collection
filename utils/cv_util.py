@@ -301,59 +301,98 @@ def inpaint_tag(img, corners, tag_scale, n_samples=16):
     return img
 
 # =========== other utils ====================
+def resize_center_crop(
+        image: np.ndarray,
+        out_res: Tuple[int, int],
+        crop_ratio: float = 1.0,
+        ) -> np.ndarray:
+    """Aspect-preserving resize followed by a center crop (method A).
+
+    ``out_res`` uses OpenCV's ``(width, height)`` order. For the normal
+    1280x800 -> 224x224 path this first produces 359x224 with INTER_AREA,
+    then crops columns [67:291).
+    """
+    if image is None or image.ndim < 2:
+        raise ValueError("image must have at least two dimensions")
+
+    output_width, output_height = map(int, out_res)
+    input_height, input_width = image.shape[:2]
+    if min(input_width, input_height, output_width, output_height) <= 0:
+        raise ValueError(
+            f"image and output dimensions must be positive: "
+            f"input={input_width}x{input_height}, output={output_width}x{output_height}"
+        )
+    if not 0 < crop_ratio <= 1.0:
+        raise ValueError(f"crop_ratio must be in (0, 1], got {crop_ratio}")
+
+    if crop_ratio < 1.0:
+        crop_width = max(1, round(input_width * crop_ratio))
+        crop_height = max(1, round(input_height * crop_ratio))
+        start_x = (input_width - crop_width) // 2
+        start_y = (input_height - crop_height) // 2
+        image = image[
+            start_y:start_y + crop_height,
+            start_x:start_x + crop_width,
+        ]
+        input_height, input_width = image.shape[:2]
+
+    # The LeRobot conversion stage sees images already produced by step 01.
+    # Keep those pixels unchanged instead of resampling a second time.
+    if (input_width, input_height) == (output_width, output_height):
+        return image
+
+    # Scale until the target is fully covered while preserving aspect ratio.
+    # Fix one target dimension exactly; ceil only the other dimension so the
+    # discrete result always contains the requested crop.
+    if input_width * output_height >= input_height * output_width:
+        resized_height = output_height
+        resized_width = math.ceil(input_width * output_height / input_height)
+    else:
+        resized_width = output_width
+        resized_height = math.ceil(input_height * output_width / input_width)
+
+    interpolation = (
+        cv2.INTER_AREA
+        if resized_width <= input_width and resized_height <= input_height
+        else cv2.INTER_LINEAR
+    )
+    resized = cv2.resize(
+        image,
+        (resized_width, resized_height),
+        interpolation=interpolation,
+    )
+
+    start_x = (resized_width - output_width) // 2
+    start_y = (resized_height - output_height) // 2
+    return resized[
+        start_y:start_y + output_height,
+        start_x:start_x + output_width,
+    ]
+
+
 def get_fisheye_image_transform(in_res, out_res, crop_ratio:float = 1.0, bgr_to_rgb: bool=False):
     iw, ih = in_res
-    ow, oh = out_res
-    ch = round(ih * crop_ratio)
-    cw = round(ih * crop_ratio / oh * ow)
-    interp_method = cv2.INTER_AREA
-
-    w_slice_start = (iw - cw) // 2
-    w_slice = slice(w_slice_start, w_slice_start + cw)
-    h_slice_start = (ih - ch) // 2
-    h_slice = slice(h_slice_start, h_slice_start + ch)
-    c_slice = slice(None)
-    if bgr_to_rgb:
-        c_slice = slice(None, None, -1)
 
     def transform(img: np.ndarray):
-        assert img.shape == ((ih,iw,3))
-        # crop
-        img = img[h_slice, w_slice, c_slice]
-        # resize
-        img = cv2.resize(img, out_res, interpolation=interp_method)
+        assert img.shape == (ih, iw, 3)
+        img = resize_center_crop(img, out_res, crop_ratio=crop_ratio)
+        if bgr_to_rgb:
+            img = img[..., ::-1]
         return img
-    
+
     return transform
 
 # TODO: Directly copied, but definitely not reasonable, needs modification.
 def get_tactile_image_transform(in_res, out_res, crop_ratio:float = 1.0, bgr_to_rgb: bool=False):
     iw, ih = in_res
-    ow, oh = out_res
-    ch = round(ih * crop_ratio)
-    cw = round(ih * crop_ratio / oh * ow)
-    interp_method = cv2.INTER_AREA
-
-    w_slice_start = (iw - cw) // 2
-    w_slice = slice(w_slice_start, w_slice_start + cw)
-    h_slice_start = (ih - ch) // 2
-    h_slice = slice(h_slice_start, h_slice_start + ch)
-    c_slice = slice(None)
-    if bgr_to_rgb:
-        c_slice = slice(None, None, -1)
 
     def transform(img: np.ndarray):
         # Flexible shape check - allow for different input resolutions
         if img.shape != (ih, iw, 3):
             print(f"Warning: Expected image shape ({ih}, {iw}, 3), got {img.shape}. Adjusting...")
-            # Simply resize without cropping if dimensions don't match
-            img = cv2.resize(img, out_res, interpolation=interp_method)
-            return img
-        
-        # crop
-        img = img[h_slice, w_slice, c_slice]
-        # resize
-        img = cv2.resize(img, out_res, interpolation=interp_method)
+        img = resize_center_crop(img, out_res, crop_ratio=crop_ratio)
+        if bgr_to_rgb:
+            img = img[..., ::-1]
         return img
-    
+
     return transform

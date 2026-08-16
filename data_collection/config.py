@@ -21,8 +21,9 @@ class CamConfig:
     gain: int = 100
     gamma: int = 100
     capture_timestamp_delay: float = 0.101
-    left_hand_path: str = "/dev/video0"
-    right_hand_path: str = "/dev/video2"
+    # Stable links created by scripts/setup_hbvcam_udev.sh.
+    left_hand_path: str = "/dev/cam_left"
+    right_hand_path: str = "/dev/cam_right"
 
 
 @dataclass

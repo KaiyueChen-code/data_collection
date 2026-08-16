@@ -23,6 +23,13 @@ data_collection/pipeline/
 ├── 04_generate_dataset_plan.py    # 时间对齐和 episode plan
 └── 05_convert_raw_to_lerobot.py   # Raw -> LeRobot
 ```
+## 相机端口配置和左右检查
+```bash
+#配置环境
+bash scripts/setup_visual_env.sh
+
+#source
+
 
 ## 数据采集和处理
 

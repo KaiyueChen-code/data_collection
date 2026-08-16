@@ -59,7 +59,20 @@ class CameraHandler:
 
 class V4L2Camera:
     def __init__(self, device_path="/dev/video0", format="YUYV", width=640, height=480):
-        self.device_path = device_path
+        self.device_path = os.path.expanduser(device_path)
+        if not os.path.exists(self.device_path):
+            setup_hint = ""
+            if self.device_path in ("/dev/cam_left", "/dev/cam_right"):
+                setup_hint = (
+                    " Run 'bash scripts/setup_hbvcam_udev.sh', then reconnect "
+                    "the cameras and check the links."
+                )
+            raise FileNotFoundError(
+                f"Camera device does not exist: {self.device_path}.{setup_hint}"
+            )
+        resolved_path = os.path.realpath(self.device_path)
+        if self.device_path != resolved_path:
+            print(f"Camera mapping: {self.device_path} -> {resolved_path}")
         self.fd = None
         self.width = width
         self.height = height

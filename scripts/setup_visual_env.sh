@@ -94,6 +94,7 @@ install_apt_packages() {
         pkg-config \
         python3-dev \
         python3-venv \
+        udev \
         v4l-utils
 }
 
