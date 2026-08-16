@@ -410,7 +410,6 @@ class DataSelector:
         self._frame_cache: dict[int, np.ndarray] = {}
         self._plot_cache: tuple[int, int, np.ndarray] | None = None  # (ep, frame, img)
         self._reset_mouse_zoom_requested = False
-        self._display_size = (self.W, self._total_height())
 
         self._create_window(self.W, self._total_height())
 
@@ -425,12 +424,8 @@ class DataSelector:
 
     def _create_window(self, width: int, height: int,
                        x: int | None = None, y: int | None = None) -> None:
-        # GUI_NORMAL removes Qt's zoom toolbar/context menu. FREERATIO keeps the
-        # rendered frame bound to the complete client area while resizing.
-        flags = (cv2.WINDOW_NORMAL
-                 | getattr(cv2, "WINDOW_GUI_NORMAL", 0)
-                 | getattr(cv2, "WINDOW_FREERATIO", 0))
-        cv2.namedWindow(self.WIN, flags)
+        # WINDOW_NORMAL lets HighGUI scale the full canvas with the window.
+        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.WIN, max(1, width), max(1, height))
         if x is not None and y is not None:
             cv2.moveWindow(self.WIN, x, y)
@@ -451,29 +446,7 @@ class DataSelector:
         cv2.destroyWindow(self.WIN)
         cv2.waitKey(1)
         self._create_window(width, height, x, y)
-        self._display_size = (width, height)
         self._reset_mouse_zoom_requested = False
-
-    def _fit_frame_to_window(self, frame: np.ndarray) -> np.ndarray:
-        """Scale the complete UI canvas to the current window client area."""
-        width, height = self._display_size
-        try:
-            _, _, rect_w, rect_h = cv2.getWindowImageRect(self.WIN)
-            if rect_w > 0 and rect_h > 0:
-                width, height = rect_w, rect_h
-        except cv2.error:
-            # Wayland may not expose window geometry; keep the last valid size.
-            pass
-
-        self._display_size = (max(1, width), max(1, height))
-        if frame.shape[1] == width and frame.shape[0] == height:
-            return frame
-        interpolation = (
-            cv2.INTER_AREA
-            if width < frame.shape[1] or height < frame.shape[0]
-            else cv2.INTER_LINEAR
-        )
-        return cv2.resize(frame, self._display_size, interpolation=interpolation)
 
     def _load_episode(self):
         self._df = self.loader.get(self.ep_idx)
@@ -749,14 +722,6 @@ class DataSelector:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
-        # The displayed canvas follows the window size. Convert click
-        # coordinates back to the fixed logical UI coordinates used below.
-        display_w, display_h = self._display_size
-        x = int(x * self.W / max(display_w, 1))
-        y = int(y * self._total_height() / max(display_h, 1))
-        x = max(0, min(x, self.W - 1))
-        y = max(0, min(y, self._total_height() - 1))
-
         # 累积 y 偏移到各 section
         y_offset = self.HEADER_H + self.SEP  # after header
         # camera section uses a fixed total area height
@@ -836,7 +801,6 @@ class DataSelector:
         try:
             while True:
                 frame_img = self._build_frame()
-                frame_img = self._fit_frame_to_window(frame_img)
                 cv2.imshow(self.WIN, frame_img)
 
                 # 自动播放
