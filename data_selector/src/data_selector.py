@@ -409,10 +409,9 @@ class DataSelector:
 
         self._frame_cache: dict[int, np.ndarray] = {}
         self._plot_cache: tuple[int, int, np.ndarray] | None = None  # (ep, frame, img)
+        self._reset_mouse_zoom_requested = False
 
-        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.WIN, self.W, self._total_height())
-        cv2.setMouseCallback(self.WIN, self._on_mouse)
+        self._create_window(self.W, self._total_height())
 
         self._load_episode()
 
@@ -422,6 +421,36 @@ class DataSelector:
                 + self.PLOT_H + self.SEP
                 + self.PROGRESS_H + self.SEP
                 + self.CTRL_H)
+
+    def _create_window(self, width: int, height: int,
+                       x: int | None = None, y: int | None = None) -> None:
+        # GUI_NORMAL removes Qt's zoom toolbar/context menu. FREERATIO keeps the
+        # rendered frame bound to the complete client area while resizing.
+        flags = (cv2.WINDOW_NORMAL
+                 | getattr(cv2, "WINDOW_GUI_NORMAL", 0)
+                 | getattr(cv2, "WINDOW_FREERATIO", 0))
+        cv2.namedWindow(self.WIN, flags)
+        cv2.resizeWindow(self.WIN, max(1, width), max(1, height))
+        if x is not None and y is not None:
+            cv2.moveWindow(self.WIN, x, y)
+        cv2.setMouseCallback(self.WIN, self._on_mouse)
+
+    def _restore_window_bound_view(self) -> None:
+        """Discard HighGUI's mouse-wheel zoom while preserving window geometry."""
+        x = y = None
+        width, height = self.W, self._total_height()
+        try:
+            rect_x, rect_y, rect_w, rect_h = cv2.getWindowImageRect(self.WIN)
+            if rect_w > 0 and rect_h > 0:
+                x, y, width, height = rect_x, rect_y, rect_w, rect_h
+        except cv2.error:
+            # getWindowImageRect is unavailable on some Wayland backends.
+            pass
+
+        cv2.destroyWindow(self.WIN)
+        cv2.waitKey(1)
+        self._create_window(width, height, x, y)
+        self._reset_mouse_zoom_requested = False
 
     def _load_episode(self):
         self._df = self.loader.get(self.ep_idx)
@@ -684,6 +713,16 @@ class DataSelector:
     # ── 鼠标回调 ──────────────────────────────────
 
     def _on_mouse(self, event, x, y, flags, param):
+        wheel_events = {
+            getattr(cv2, "EVENT_MOUSEWHEEL", -1),
+            getattr(cv2, "EVENT_MOUSEHWHEEL", -2),
+        }
+        if event in wheel_events:
+            # Qt applies its own zoom after this callback returns. Recreate the
+            # viewport in the main loop to restore a window-bound 100% view.
+            self._reset_mouse_zoom_requested = True
+            return
+
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
@@ -790,6 +829,10 @@ class DataSelector:
 
                 wait_ms = 1 if self.playing else 30
                 key = cv2.waitKey(wait_ms) & 0xFF
+
+                if self._reset_mouse_zoom_requested:
+                    self._restore_window_bound_view()
+                    continue
 
                 if key == 255:
                     continue
