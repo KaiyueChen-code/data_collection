@@ -410,6 +410,8 @@ class DataSelector:
         self._frame_cache: dict[int, np.ndarray] = {}
         self._plot_cache: tuple[int, int, np.ndarray] | None = None  # (ep, frame, img)
         self._reset_mouse_zoom_requested = False
+        self._stable_window_size = (self.W, self._total_height())
+        self._window_rect_settle_frames = 2
 
         self._create_window(self.W, self._total_height())
 
@@ -422,30 +424,36 @@ class DataSelector:
                 + self.PROGRESS_H + self.SEP
                 + self.CTRL_H)
 
-    def _create_window(self, width: int, height: int,
-                       x: int | None = None, y: int | None = None) -> None:
+    def _create_window(self, width: int, height: int) -> None:
         # WINDOW_NORMAL lets HighGUI scale the full canvas with the window.
-        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
+        # GUI_NORMAL removes Qt's toolbar/context menu zoom controls.
+        window_flags = cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0)
+        cv2.namedWindow(self.WIN, window_flags)
         cv2.resizeWindow(self.WIN, max(1, width), max(1, height))
-        if x is not None and y is not None:
-            cv2.moveWindow(self.WIN, x, y)
         cv2.setMouseCallback(self.WIN, self._on_mouse)
 
-    def _restore_window_bound_view(self) -> None:
-        """Discard HighGUI's mouse-wheel zoom while preserving window geometry."""
-        x = y = None
-        width, height = self.W, self._total_height()
+    def _remember_stable_window_size(self) -> None:
+        """Cache geometry before waitKey dispatches a possible wheel event."""
+        if self._reset_mouse_zoom_requested:
+            return
+        if self._window_rect_settle_frames > 0:
+            self._window_rect_settle_frames -= 1
+            return
         try:
-            rect_x, rect_y, rect_w, rect_h = cv2.getWindowImageRect(self.WIN)
-            if rect_w > 0 and rect_h > 0:
-                x, y, width, height = rect_x, rect_y, rect_w, rect_h
+            _, _, width, height = cv2.getWindowImageRect(self.WIN)
+            if width > 0 and height > 0:
+                self._stable_window_size = (width, height)
         except cv2.error:
-            # getWindowImageRect is unavailable on some Wayland backends.
+            # Wayland may not expose window geometry; retain the last size.
             pass
 
+    def _restore_window_bound_view(self) -> None:
+        """Discard mouse-wheel zoom using geometry captured before the event."""
+        width, height = self._stable_window_size
         cv2.destroyWindow(self.WIN)
         cv2.waitKey(1)
-        self._create_window(width, height, x, y)
+        self._create_window(width, height)
+        self._window_rect_settle_frames = 2
         self._reset_mouse_zoom_requested = False
 
     def _load_episode(self):
@@ -802,6 +810,7 @@ class DataSelector:
             while True:
                 frame_img = self._build_frame()
                 cv2.imshow(self.WIN, frame_img)
+                self._remember_stable_window_size()
 
                 # 自动播放
                 if self.playing:
