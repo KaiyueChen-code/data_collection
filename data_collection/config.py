@@ -13,13 +13,16 @@ class CamConfig:
     camera_format: str = "MJPG"
     camera_width: int = 3840
     camera_height: int = 800
-    auto_exposure: int = 1
-    exposure: int | None = None
-    auto_white_balance: int = 1
-    wb_temperature: int | None = None
+    # Legacy camera convention used by the recorder: 1=auto, 3=manual.
+    auto_exposure: int = 3
+    exposure: int | None = 170
+    auto_white_balance: int = 0
+    wb_temperature: int | None = 4600
     brightness: int = 0
     gain: int = 40
     gamma: int = 50
+    preview_window_width: int = 1920
+    preview_window_height: int = 400
     capture_timestamp_delay: float = 0.101
     # Stable links created by scripts/setup_hbvcam_udev.sh.
     left_hand_path: str = "/dev/cam_left"

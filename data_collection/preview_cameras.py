@@ -146,6 +146,11 @@ class CameraPreview:
         # 在主线程中预先创建窗口，避免 Qt 跨线程错误
         for name in self.camera_instances:
             cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(
+                name,
+                self.config.preview_window_width,
+                self.config.preview_window_height,
+            )
 
         fps_counters = {name: 0 for name in self.camera_instances}
         fps_timers = {name: time.time() for name in self.camera_instances}
