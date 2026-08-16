@@ -31,7 +31,12 @@ bash scripts/setup_visual_env.sh
 #source
 source .venv-visual/bin/activate
 
+#在scripts\setup_camera_path.sh中修改左右相机对应的端口
+#然后先可视化检查
+python data_collection/preview_cameras.py
 
+#检查通过后运行：
+bash scripts/setup_camera_path.sh
 
 ## 数据采集和处理
 
@@ -74,5 +79,3 @@ python3 data_selector/src/run_selector_workflow.py task01 \
   --only apply
 ```
 
-处理过程使用根目录下的 `data/{task_name}`，相机内参位于
-`assets/intri_result/gopro_intrinsics_2_7k.json`。
