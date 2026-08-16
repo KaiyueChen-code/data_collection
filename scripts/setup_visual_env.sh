@@ -140,6 +140,7 @@ import numpy
 import pandas
 import pyarrow
 import pyudev
+import pygame
 import v4l2
 
 print("Visual environment import check: OK")

@@ -3,3 +3,4 @@ opencv-python==4.11.0.86
 pandas
 pyarrow
 matplotlib
+pygame==2.6.1

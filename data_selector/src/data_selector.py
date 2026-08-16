@@ -32,6 +32,13 @@ from io import BytesIO
 import numpy as np
 import cv2
 
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+try:
+    import pygame
+except ImportError:
+    print("缺少 pygame: python3 -m pip install pygame==2.6.1")
+    sys.exit(1)
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -409,11 +416,6 @@ class DataSelector:
 
         self._frame_cache: dict[int, np.ndarray] = {}
         self._plot_cache: tuple[int, int, np.ndarray] | None = None  # (ep, frame, img)
-        self._reset_mouse_zoom_requested = False
-        self._stable_window_size = (self.W, self._total_height())
-        self._window_rect_settle_frames = 2
-
-        self._create_window(self.W, self._total_height())
 
         self._load_episode()
 
@@ -423,38 +425,6 @@ class DataSelector:
                 + self.PLOT_H + self.SEP
                 + self.PROGRESS_H + self.SEP
                 + self.CTRL_H)
-
-    def _create_window(self, width: int, height: int) -> None:
-        # WINDOW_NORMAL lets HighGUI scale the full canvas with the window.
-        # GUI_NORMAL removes Qt's toolbar/context menu zoom controls.
-        window_flags = cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0)
-        cv2.namedWindow(self.WIN, window_flags)
-        cv2.resizeWindow(self.WIN, max(1, width), max(1, height))
-        cv2.setMouseCallback(self.WIN, self._on_mouse)
-
-    def _remember_stable_window_size(self) -> None:
-        """Cache geometry before waitKey dispatches a possible wheel event."""
-        if self._reset_mouse_zoom_requested:
-            return
-        if self._window_rect_settle_frames > 0:
-            self._window_rect_settle_frames -= 1
-            return
-        try:
-            _, _, width, height = cv2.getWindowImageRect(self.WIN)
-            if width > 0 and height > 0:
-                self._stable_window_size = (width, height)
-        except cv2.error:
-            # Wayland may not expose window geometry; retain the last size.
-            pass
-
-    def _restore_window_bound_view(self) -> None:
-        """Discard mouse-wheel zoom using geometry captured before the event."""
-        width, height = self._stable_window_size
-        cv2.destroyWindow(self.WIN)
-        cv2.waitKey(1)
-        self._create_window(width, height)
-        self._window_rect_settle_frames = 2
-        self._reset_mouse_zoom_requested = False
 
     def _load_episode(self):
         self._df = self.loader.get(self.ep_idx)
@@ -637,7 +607,7 @@ class DataSelector:
         # ── 键盘提示（底部）
         hints = (
             "A / D : frame    W / S : episode    Space : play    "
-            "1–4 : speed    X : delete    U : undo    Q : quit"
+            "1–4 : speed    X : delete    U : undo    F11 : fullscreen    Q : quit"
         )
         draw_text(bar, hints, (14, self.CTRL_H - 10), scale=0.38, color=C_GRAY)
 
@@ -716,20 +686,7 @@ class DataSelector:
 
     # ── 鼠标回调 ──────────────────────────────────
 
-    def _on_mouse(self, event, x, y, flags, param):
-        wheel_events = {
-            getattr(cv2, "EVENT_MOUSEWHEEL", -1),
-            getattr(cv2, "EVENT_MOUSEHWHEEL", -2),
-        }
-        if event in wheel_events:
-            # Qt applies its own zoom after this callback returns. Recreate the
-            # viewport in the main loop to restore a window-bound 100% view.
-            self._reset_mouse_zoom_requested = True
-            return
-
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-
+    def _on_left_click(self, x: int, y: int) -> None:
         # 累积 y 偏移到各 section
         y_offset = self.HEADER_H + self.SEP  # after header
         # camera section uses a fixed total area height
@@ -804,13 +761,115 @@ class DataSelector:
         print(f"\n  Dataset FPS: {fps_data}")
         print(f"  Episodes:   {self.n_ep}")
         print("  Controls:  A/D=frame  W/S=episode  Space=play  "
-              "1–4=speed(0.5/1/2/4x)  K=save  X=delete  U=undo  Q=quit\n")
+              "1–4=speed(0.5/1/2/4x)  X=delete  U=undo  "
+              "F11=fullscreen  Q=quit\n")
+
+        os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+        pygame.display.init()
+        display_info = pygame.display.Info()
+        display_w = display_info.current_w if display_info.current_w > 0 else self.W
+        display_h = (
+            display_info.current_h
+            if display_info.current_h > 0
+            else self._total_height()
+        )
+        initial_size = (
+            min(self.W, display_w),
+            min(self._total_height(), display_h),
+        )
+        screen = pygame.display.set_mode(initial_size, pygame.RESIZABLE)
+        pygame.display.set_caption(self.WIN)
+        clock = pygame.time.Clock()
+        windowed_size = initial_size
+        fullscreen = False
+        running = True
 
         try:
-            while True:
-                frame_img = self._build_frame()
-                cv2.imshow(self.WIN, frame_img)
-                self._remember_stable_window_size()
+            while running:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                        break
+
+                    if event.type == pygame.MOUSEWHEEL:
+                        # Intentionally ignored: the wheel never changes view size.
+                        continue
+
+                    if event.type == pygame.VIDEORESIZE and not fullscreen:
+                        windowed_size = (max(1, event.w), max(1, event.h))
+                        screen = pygame.display.set_mode(
+                            windowed_size, pygame.RESIZABLE
+                        )
+                        continue
+
+                    if event.type == pygame.MOUSEBUTTONDOWN:
+                        # Some Linux backends report wheel motion as buttons 4/5.
+                        if event.button != 1:
+                            continue
+                        screen_w, screen_h = screen.get_size()
+                        logical_x = int(event.pos[0] * self.W / max(screen_w, 1))
+                        logical_y = int(
+                            event.pos[1] * self._total_height() / max(screen_h, 1)
+                        )
+                        logical_x = max(0, min(logical_x, self.W - 1))
+                        logical_y = max(
+                            0, min(logical_y, self._total_height() - 1)
+                        )
+                        self._on_left_click(logical_x, logical_y)
+                        continue
+
+                    if event.type != pygame.KEYDOWN:
+                        continue
+
+                    key = event.key
+                    if key in (pygame.K_q, pygame.K_ESCAPE):
+                        running = False
+                    elif key == pygame.K_F11:
+                        if fullscreen:
+                            screen = pygame.display.set_mode(
+                                windowed_size, pygame.RESIZABLE
+                            )
+                            fullscreen = False
+                        else:
+                            windowed_size = screen.get_size()
+                            screen = pygame.display.set_mode(
+                                (0, 0), pygame.FULLSCREEN
+                            )
+                            fullscreen = True
+                    elif key in (pygame.K_d, pygame.K_RIGHT):
+                        n = len(self._df)
+                        if self.frame_idx < n - 1:
+                            self.frame_idx += 1
+                            self._plot_cache = None
+                        else:
+                            self._go_ep(1)
+                    elif key in (pygame.K_a, pygame.K_LEFT):
+                        if self.frame_idx > 0:
+                            self.frame_idx -= 1
+                            self._plot_cache = None
+                    elif key in (pygame.K_w, pygame.K_UP):
+                        self._go_ep(1)
+                    elif key in (pygame.K_s, pygame.K_DOWN):
+                        self._go_ep(-1)
+                    elif key == pygame.K_SPACE:
+                        self.playing = not self.playing
+                        self._last_play_t = time.time()
+                    elif key in (pygame.K_x, pygame.K_DELETE):
+                        self._mark('delete')
+                        self._go_ep(1)
+                    elif key == pygame.K_u:
+                        self._undo()
+                    elif key == pygame.K_1:
+                        self.play_spd = 0.5
+                    elif key == pygame.K_2:
+                        self.play_spd = 1.0
+                    elif key == pygame.K_3:
+                        self.play_spd = 2.0
+                    elif key == pygame.K_4:
+                        self.play_spd = 4.0
+
+                if not running:
+                    break
 
                 # 自动播放
                 if self.playing:
@@ -832,62 +891,25 @@ class DataSelector:
                             self._plot_cache = None
                             self.playing = False
 
-                wait_ms = 1 if self.playing else 30
-                key = cv2.waitKey(wait_ms) & 0xFF
-
-                if self._reset_mouse_zoom_requested:
-                    self._restore_window_bound_view()
-                    continue
-
-                if key == 255:
-                    continue
-
-                if key in (ord('q'), ord('Q'), 27):
-                    break
-
-                elif key in (ord('d'), ord('D')):
-                    n = len(self._df)
-                    if self.frame_idx < n - 1:
-                        self.frame_idx += 1
-                        self._plot_cache = None
-                    else:
-                        self._go_ep(1)
-
-                elif key in (ord('a'), ord('A')):
-                    if self.frame_idx > 0:
-                        self.frame_idx -= 1
-                        self._plot_cache = None
-
-                elif key in (ord('w'), ord('W')):
-                    self._go_ep(1)
-
-                elif key in (ord('s'), ord('S')):
-                    self._go_ep(-1)
-
-                elif key in (ord(' '),):
-                    self.playing = not self.playing
-                    self._last_play_t = time.time()
-
-                elif key in (ord('x'), ord('X')):   # X
-                    self._mark('delete')
-                    # auto-advance to next episode
-                    self._go_ep(1)
-
-                elif key in (ord('u'), ord('U')):
-                    self._undo()
-
-                elif key in (ord('1'),):
-                    self.play_spd = 0.5
-                elif key in (ord('2'),):
-                    self.play_spd = 1.0
-                elif key in (ord('3'),):
-                    self.play_spd = 2.0
-                elif key in (ord('4'),):
-                    self.play_spd = 4.0
+                frame_img = self._build_frame()
+                frame_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGR2RGB)
+                frame_surface = pygame.image.frombuffer(
+                    frame_rgb.tobytes(),
+                    (frame_rgb.shape[1], frame_rgb.shape[0]),
+                    "RGB",
+                )
+                target_size = screen.get_size()
+                if frame_surface.get_size() != target_size:
+                    frame_surface = pygame.transform.smoothscale(
+                        frame_surface, target_size
+                    )
+                screen.blit(frame_surface, (0, 0))
+                pygame.display.flip()
+                clock.tick(60 if self.playing else 30)
         except KeyboardInterrupt:
             print("\n[INFO] KeyboardInterrupt received, saving results before exit...")
         finally:
-            cv2.destroyAllWindows()
+            pygame.display.quit()
             self._save_results()
 
     # ── 保存结果 ──────────────────────────────────
