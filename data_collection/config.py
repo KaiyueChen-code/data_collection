@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DATASET_RAW_TASK_NAME = "0407_test_raw"
+DATASET_RAW_TASK_NAME = "test0816"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DATA_DIR = str(PROJECT_ROOT / "data" / "raw")
 SELECTED_DATA_DIR = str(PROJECT_ROOT / "data" / "selected")
