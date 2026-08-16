@@ -4,7 +4,7 @@ set -Eeuo pipefail
 #运行：v4l2-ctl --list-device
 RULE_FILE="/etc/udev/rules.d/99-hbvcam.rules"
 #在下面修改
-LEFT_ID_PATH_DEFAULT="pci-0000:00:14.0-usb-0:4.3:1.0"
+LEFT_ID_PATH_DEFAULT="pci-0000:00:14.0-usb-0:2:1.0"
 RIGHT_ID_PATH_DEFAULT="pci-0000:00:14.0-usb-0:3:1.0"
 
 LEFT_ID_PATH="${LEFT_ID_PATH:-${LEFT_ID_PATH_DEFAULT}}"

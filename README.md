@@ -29,6 +29,8 @@ data_collection/pipeline/
 bash scripts/setup_visual_env.sh
 
 #source
+source .venv-visual/bin/activate
+
 
 
 ## 数据采集和处理

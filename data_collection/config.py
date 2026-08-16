@@ -18,8 +18,8 @@ class CamConfig:
     auto_white_balance: int = 1
     wb_temperature: int | None = None
     brightness: int = 0
-    gain: int = 100
-    gamma: int = 100
+    gain: int = 40
+    gamma: int = 50
     capture_timestamp_delay: float = 0.101
     # Stable links created by scripts/setup_hbvcam_udev.sh.
     left_hand_path: str = "/dev/cam_left"
@@ -53,7 +53,7 @@ class DataConvertConfig:
     fisheye_mask_center: tuple[int, int] | None = None
     fisheye_mask_fill_color: tuple[int, int, int] = (0, 0, 0)
 
-    cam_intrinsic_json_path: str = "./assets/intri_result/gopro_intrinsics_2_7k.json"
+    cam_intrinsic_json_path: str = "./assets/intri_result/camera_intrinsics.json"
     aruco_dict: str = "DICT_4X4_50"
     marker_size_map: dict[int, float] = field(
         default_factory=lambda: {0: 0.02, 1: 0.02, 2: 0.02, 3: 0.02}
