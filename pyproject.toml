@@ -1,0 +1,19 @@
+[project]
+name = "vb-vla-data-collection"
+version = "0.1.0"
+description = "Standalone bimanual VB-VLA data collection and Raw-to-LeRobot pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.22.4,<2.0.0",
+    "scipy",
+    "pandas",
+    "pyarrow",
+    "tqdm",
+    "omegaconf",
+    "opencv-contrib-python==4.11.0.86",
+    "transforms3d",
+    "pyudev",
+    "v4l2-python3",
+    "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+]

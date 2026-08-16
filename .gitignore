@@ -1,0 +1,14 @@
+.venv-collection/
+.venv-visual/
+__pycache__/
+*.py[cod]
+.DS_Store
+# Generated datasets and intermediate data
+data/**
+!data/raw/
+!data/raw/.gitkeep
+!data/selected/
+!data/selected/.gitkeep
+
+# Generated data-selection records
+data_selector/selections/*.json
