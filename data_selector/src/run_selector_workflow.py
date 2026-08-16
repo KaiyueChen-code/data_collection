@@ -79,10 +79,11 @@ def main() -> None:
         [
             python,
             str(SRC_DIR / "data_selector.py"),
+            "--dataset",
             str(dataset_dir),
             "--output",
             str(selection_path),
-            "--start-episode",
+            "--start",
             str(args.start_episode),
         ]
     )
