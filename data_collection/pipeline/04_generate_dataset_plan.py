@@ -5,6 +5,7 @@ import argparse
 import pickle
 import json
 import csv
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
@@ -19,6 +20,201 @@ DATA_DIR = PROJECT_ROOT / "data" / "raw"
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.pose_util import mat_to_pose
+
+
+POSE_CACHE_VERSION = 2
+
+
+def _trajectory_source_fingerprint(json_files: list[Path]) -> str:
+    """Return a cheap fingerprint that changes when a source JSON changes."""
+    source_info = []
+    for path in json_files:
+        stat = path.stat()
+        source_info.append((path.name, stat.st_size, stat.st_mtime_ns))
+    payload = json.dumps(source_info, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _raw_wrist_pose(entry: dict, wrist_key: str):
+    """Extract one raw Quest wrist pose using the legacy fallback rules."""
+    if wrist_key not in entry:
+        return None
+    wrist = entry[wrist_key]
+    pos = wrist.get("position", {})
+    rot = wrist.get("rotation", {})
+    if isinstance(pos, dict):
+        x = float(pos.get("x", 0.0))
+        y = float(pos.get("y", 0.0))
+        z = float(pos.get("z", 0.0))
+    else:
+        try:
+            x, y, z = map(float, pos[:3])
+        except Exception:
+            x = y = z = 0.0
+    if isinstance(rot, dict):
+        q_x = float(rot.get("x", 0.0))
+        q_y = float(rot.get("y", 0.0))
+        q_z = float(rot.get("z", 0.0))
+        q_w = float(rot.get("w", 1.0))
+    else:
+        try:
+            q_x, q_y, q_z, q_w = map(float, rot[:4])
+        except Exception:
+            q_x = q_y = q_z = 0.0
+            q_w = 1.0
+    return [x, y, z, q_x, q_y, q_z, q_w]
+
+
+def _pose_cache_paths(all_traj_dir: Path, wrist_key: str | None = None):
+    prefix = all_traj_dir / f".quest_pose_cache_v{POSE_CACHE_VERSION}"
+    paths = {"meta": Path(f"{prefix}_meta.json")}
+    if wrist_key is not None:
+        paths["timestamps"] = Path(f"{prefix}_{wrist_key}_timestamps.npy")
+        paths["poses"] = Path(f"{prefix}_{wrist_key}_poses.npy")
+    return paths
+
+
+def _write_npy_atomic(path: Path, array: np.ndarray):
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with tmp_path.open("wb") as f:
+            np.save(f, array, allow_pickle=False)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _write_json_atomic(path: Path, payload: dict):
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _ensure_pose_cache(task_dir: Path):
+    """Parse task-wide Quest JSON once and store mmap-friendly arrays."""
+    all_traj_dir = task_dir / "all_trajectory"
+    if not all_traj_dir.exists():
+        raise FileNotFoundError(f"all_trajectory directory not found: {all_traj_dir}")
+
+    json_files = sorted(all_traj_dir.glob("quest_poses_*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No quest_poses_*.json found in {all_traj_dir}")
+
+    fingerprint = _trajectory_source_fingerprint(json_files)
+    meta_path = _pose_cache_paths(all_traj_dir)["meta"]
+    wrist_keys = ("left_wrist", "right_wrist")
+    cache_files = []
+    for wrist_key in wrist_keys:
+        paths = _pose_cache_paths(all_traj_dir, wrist_key)
+        cache_files.extend([paths["timestamps"], paths["poses"]])
+
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if (
+            meta.get("version") == POSE_CACHE_VERSION
+            and meta.get("source_fingerprint") == fingerprint
+            and all(path.exists() for path in cache_files)
+        ):
+            return meta
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    print(f"[INFO] Building Quest pose cache from {len(json_files)} JSON files (one-time)...")
+    timestamp_chunks = {key: [] for key in wrist_keys}
+    pose_chunks = {key: [] for key in wrist_keys}
+    total_entries = 0
+
+    progress_every = max(1, len(json_files) // 20)
+    for file_index, json_path in enumerate(json_files, start=1):
+        try:
+            with json_path.open("r", encoding="utf-8") as f:
+                pose_list = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Failed to parse JSON file {json_path}: {e}. "
+                "This might be due to corrupted data or invalid JSON format."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Error reading JSON file {json_path}: {e}") from e
+
+        total_entries += len(pose_list)
+        file_timestamps = {key: [] for key in wrist_keys}
+        file_poses = {key: [] for key in wrist_keys}
+        for entry in pose_list:
+            try:
+                timestamp = float(entry.get("timestamp_unix", entry.get("timestamp", 0.0)))
+            except (TypeError, ValueError):
+                timestamp = 0.0
+            for wrist_key in wrist_keys:
+                raw_pose = _raw_wrist_pose(entry, wrist_key)
+                if raw_pose is not None:
+                    file_timestamps[wrist_key].append(timestamp)
+                    file_poses[wrist_key].append(raw_pose)
+
+        for wrist_key in wrist_keys:
+            if file_timestamps[wrist_key]:
+                timestamp_chunks[wrist_key].append(
+                    np.asarray(file_timestamps[wrist_key], dtype=np.float64)
+                )
+                pose_chunks[wrist_key].append(
+                    np.asarray(file_poses[wrist_key], dtype=np.float64)
+                )
+        if file_index % progress_every == 0 or file_index == len(json_files):
+            print(
+                f"[INFO] Cached {file_index}/{len(json_files)} JSON files; "
+                f"{total_entries:,} pose entries"
+            )
+
+    row_counts = {}
+    for wrist_key in wrist_keys:
+        if not timestamp_chunks[wrist_key]:
+            raise RuntimeError(f"No valid pose data for {wrist_key}")
+        timestamps = np.concatenate(timestamp_chunks[wrist_key])
+        poses = np.concatenate(pose_chunks[wrist_key], axis=0)
+        order = np.argsort(timestamps)
+        timestamps = timestamps[order]
+        poses = poses[order]
+        paths = _pose_cache_paths(all_traj_dir, wrist_key)
+        _write_npy_atomic(paths["timestamps"], timestamps)
+        _write_npy_atomic(paths["poses"], poses)
+        row_counts[wrist_key] = int(len(timestamps))
+        timestamp_chunks[wrist_key].clear()
+        pose_chunks[wrist_key].clear()
+        del timestamps, poses, order
+
+    meta = {
+        "version": POSE_CACHE_VERSION,
+        "source_fingerprint": fingerprint,
+        "source_files": len(json_files),
+        "source_entries": total_entries,
+        "rows": row_counts,
+    }
+    _write_json_atomic(meta_path, meta)
+    print(
+        f"[INFO] Quest pose cache ready: {total_entries:,} source entries; "
+        f"left={row_counts['left_wrist']:,}, right={row_counts['right_wrist']:,}"
+    )
+    return meta
+
+
+def _load_cached_wrist(task_dir: Path, wrist_key: str):
+    all_traj_dir = task_dir / "all_trajectory"
+    meta_path = _pose_cache_paths(all_traj_dir)["meta"]
+    if not meta_path.exists():
+        _ensure_pose_cache(task_dir)
+    with meta_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+    paths = _pose_cache_paths(all_traj_dir, wrist_key)
+    timestamps = np.load(paths["timestamps"], mmap_mode="r", allow_pickle=False)
+    poses = np.load(paths["poses"], mmap_mode="r", allow_pickle=False)
+    return timestamps, poses, meta
 
 def compute_rel_transform(pose: np.ndarray) -> tuple:
 
@@ -170,7 +366,13 @@ def ensure_split_images(demo_dir: Path, hand: str):
     return
 
 
-def _ensure_hand_trajectory_csv(demo_dir: Path, hand: str, force_regenerate: bool = False):
+def _ensure_hand_trajectory_csv(
+    demo_dir: Path,
+    hand: str,
+    target_times: np.ndarray,
+    pose_latency: float,
+    force_regenerate: bool = False,
+):
     """
     生成hand的轨迹CSV文件。
     
@@ -180,53 +382,81 @@ def _ensure_hand_trajectory_csv(demo_dir: Path, hand: str, force_regenerate: boo
     Args:
         demo_dir: demo目录
         hand: 'left' 或 'right'
+        target_times: 当前 demo 的相机时间戳
+        pose_latency: pose 时间延迟
         force_regenerate: 如果True，删除旧CSV并重新生成
     """
-    traj_file = demo_dir / 'pose_data' / f'{hand}_hand_trajectory.csv'
-    
-    # 删除旧CSV文件（如果需要重新生成）
-    if force_regenerate and traj_file.exists():
-        traj_file.unlink()
-        print(f"  [INFO] Deleted old CSV: {traj_file.name}")
-    
-    if traj_file.exists() and not force_regenerate:
-        return traj_file
-    
-    # 如果需要重新生成或文件不存在，开始生成
-    if force_regenerate:
-        print(f"  [INFO] Regenerating CSV for {hand} hand...")
-    else:
-        print(f"  [INFO] Generating CSV for {hand} hand...")
-    
-    task_dir = demo_dir.parent.parent
-    all_traj_dir = task_dir / "all_trajectory"
-    if not all_traj_dir.exists():
-        raise FileNotFoundError(f"all_trajectory directory not found: {all_traj_dir}")
-    
-    json_files = sorted(all_traj_dir.glob("quest_poses_*.json"))
-    if not json_files:
-        raise FileNotFoundError(f"No quest_poses_*.json found in {all_traj_dir}")
-    
-    # 互换逻辑：left_hand使用right_wrist数据，right_hand使用left_wrist数据
-    if hand == 'left':
-        quest_wrist_key = 'right_wrist'  # 左手设备用右quest追踪
-    elif hand == 'right':
-        quest_wrist_key = 'left_wrist'   # 右手设备用左quest追踪
+    pose_data_dir = demo_dir / "pose_data"
+    traj_file = pose_data_dir / f"{hand}_hand_trajectory.csv"
+    meta_file = pose_data_dir / f"{hand}_hand_trajectory.meta.json"
+
+    # 保留旧版左右 Quest 互换逻辑。
+    if hand == "left":
+        quest_wrist_key = "right_wrist"
+    elif hand == "right":
+        quest_wrist_key = "left_wrist"
     else:
         raise ValueError(f"Unknown hand: {hand}, expected 'left' or 'right'")
-    
-    # 批量读取所有JSON文件
-    print(f"  [INFO] Loading {len(json_files)} JSON files for {hand} hand...")
-    all_entries = []
-    for json_path in json_files:
+
+    task_dir = demo_dir.parent.parent
+    cached_times, cached_poses, cache_meta = _load_cached_wrist(task_dir, quest_wrist_key)
+    if len(cached_times) == 0:
+        raise RuntimeError(f"No valid pose data for {quest_wrist_key}")
+
+    target_start = float(np.min(target_times))
+    target_end = float(np.max(target_times))
+    raw_start = target_start + pose_latency
+    raw_end = target_end + pose_latency
+    expected_meta = {
+        "version": POSE_CACHE_VERSION,
+        "source_fingerprint": cache_meta["source_fingerprint"],
+        "hand": hand,
+        "wrist_key": quest_wrist_key,
+        "target_start": target_start,
+        "target_end": target_end,
+        "pose_latency": float(pose_latency),
+    }
+
+    # 只有新版本元数据完全匹配时才复用。旧的百万行 CSV 会自动重建。
+    if traj_file.exists() and meta_file.exists() and not force_regenerate:
         try:
-            with open(json_path, "r") as f:
-                pose_list = json.load(f)
-                all_entries.extend(pose_list)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse JSON file {json_path}: {e}. This might be due to corrupted data or invalid JSON format.")
-        except Exception as e:
-            raise RuntimeError(f"Error reading JSON file {json_path}: {e}")
+            with meta_file.open("r", encoding="utf-8") as f:
+                if json.load(f) == expected_meta:
+                    return traj_file
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if meta_file.exists():
+        meta_file.unlink()
+    print(f"  [INFO] Generating filtered CSV for {hand} hand...")
+
+    # 保留目标区间前后各一个 pose，保证旧版线性插值/SLERP 的边界一致。
+    left = max(0, int(np.searchsorted(cached_times, raw_start, side="left")) - 1)
+    right = min(
+        len(cached_times),
+        int(np.searchsorted(cached_times, raw_end, side="right")) + 1,
+    )
+    if right <= left:
+        left = min(left, len(cached_times) - 1)
+        right = left + 1
+
+    selected_times = np.asarray(cached_times[left:right], dtype=np.float64)
+    selected_poses = np.asarray(cached_poses[left:right], dtype=np.float64)
+    print(
+        f"  [INFO] Selected {len(selected_times):,}/{len(cached_times):,} "
+        f"pose entries for {hand} hand"
+    )
+
+    # 构造旧版输入结构，下面的坐标变换代码保持不变。
+    all_entries = []
+    for timestamp, raw_pose in zip(selected_times, selected_poses):
+        all_entries.append({
+            "timestamp_unix": float(timestamp),
+            quest_wrist_key: {
+                "position": raw_pose[:3],
+                "rotation": raw_pose[3:],
+            },
+        })
     
     # 批量提取数据并转换
     print(f"  [INFO] Processing {len(all_entries)} pose entries...")
@@ -277,7 +507,6 @@ def _ensure_hand_trajectory_csv(demo_dir: Path, hand: str, force_regenerate: boo
         raise RuntimeError(f"No valid pose data for hand '{hand}' (using {quest_wrist_key} from quest data)")
     
     # 转换为numpy数组并批量写入CSV
-    pose_data_dir = demo_dir / "pose_data"
     pose_data_dir.mkdir(exist_ok=True)
     
     print(f"  [INFO] Writing CSV with {len(timestamps)} rows...")
@@ -285,14 +514,21 @@ def _ensure_hand_trajectory_csv(demo_dir: Path, hand: str, force_regenerate: boo
     
     # 使用numpy.savetxt批量写入（比逐行写入快很多）
     header = "timestamp,x,y,z,q_x,q_y,q_z,q_w"
-    np.savetxt(
-        traj_file,
-        data_array,
-        delimiter=",",
-        header=header,
-        comments="",
-        fmt="%.9f"
-    )
+    tmp_traj_file = traj_file.with_name(f"{traj_file.name}.tmp.{os.getpid()}")
+    try:
+        np.savetxt(
+            tmp_traj_file,
+            data_array,
+            delimiter=",",
+            header=header,
+            comments="",
+            fmt="%.9f"
+        )
+        os.replace(tmp_traj_file, traj_file)
+    finally:
+        if tmp_traj_file.exists():
+            tmp_traj_file.unlink()
+    _write_json_atomic(meta_file, expected_meta)
     
     print(f"  [INFO] Generated trajectory CSV for {hand} hand (using {quest_wrist_key} data): {traj_file}")
     return traj_file
@@ -300,7 +536,13 @@ def _ensure_hand_trajectory_csv(demo_dir: Path, hand: str, force_regenerate: boo
 
 def process_hand_trajectory(demo_dir: Path, hand: str, target_times: np.ndarray, pose_latency: float, force_regenerate: bool = False):
     # 如果需要强制重新生成或文件不存在，调用生成函数
-    traj_file = _ensure_hand_trajectory_csv(demo_dir, hand, force_regenerate=force_regenerate)
+    traj_file = _ensure_hand_trajectory_csv(
+        demo_dir,
+        hand,
+        target_times,
+        pose_latency,
+        force_regenerate=force_regenerate,
+    )
 
     # Read trajectory CSV without pandas
     try:
@@ -528,11 +770,16 @@ def generate_plan(task_name: str, min_length: int = 10, use_tactile: bool = True
                 for csv_file in pose_data_dir.glob('*_hand_trajectory.csv'):
                     csv_file.unlink()
                     deleted_count += 1
+                for meta_file in pose_data_dir.glob('*_hand_trajectory.meta.json'):
+                    meta_file.unlink()
         print(f"[INFO] Deleted {deleted_count} old CSV files")
         print()
     
     demo_dirs = sorted([d for d in demos_dir.glob('demo_*') if d.is_dir()])
     print(f"Found {len(demo_dirs)} demos")
+
+    # 所有 worker 共用同一份 mmap 缓存，避免每个 demo/每只手重复解析全部 JSON。
+    _ensure_pose_cache(DATA_DIR / task_name)
     
     # 设置并行worker数量
     if num_workers is None:
