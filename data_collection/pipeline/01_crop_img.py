@@ -106,19 +106,8 @@ def crop_images_for_hand(demo_dir: Path, hand: str,
         visual = img[:, CROP_WIDTH:2*CROP_WIDTH]
         right_tactile = img[:, 2*CROP_WIDTH:3*CROP_WIDTH]
         
-        # Rotate images based on hand side
-        # 右手: visual和right_tactile旋转180度, left_tactile不旋转
-        # 左手: left_tactile旋转180度, visual和right_tactile不旋转
-        # if hand == 'right':
-        #     left_tactile_final = left_tactile
-        #     visual_final = cv2.rotate(visual, cv2.ROTATE_180)
-        #     right_tactile_final = cv2.rotate(right_tactile, cv2.ROTATE_180)
-        # else:
-        #     left_tactile_final = cv2.rotate(left_tactile, cv2.ROTATE_180)
-        #     visual_final = visual
-        #     right_tactile_final = right_tactile
-
-        left_tactile_final = cv2.rotate(left_tactile, cv2.ROTATE_180)
+        # Keep all cropped panels in their original camera orientation.
+        left_tactile_final = left_tactile
         visual_final = visual
         right_tactile_final = right_tactile
 
@@ -254,4 +243,3 @@ if __name__ == "__main__":
         tactile_out_res=tuple(args.tactile_out_res),
         num_workers=args.num_workers,
     )
-
