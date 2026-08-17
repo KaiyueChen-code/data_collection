@@ -44,9 +44,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=("select",),
+        choices=("select", "apply"),
         default="select",
-        help="打开数据筛选界面（仅支持：select）",
+        help="select 打开筛选界面；apply 应用筛选记录并生成 *_filtered 数据集",
     )
     parser.add_argument(
         "--selection",
@@ -75,16 +75,36 @@ def main() -> None:
     print(f"筛选记录：{selection_path}")
 
     python = sys.executable
+    if args.only == "select":
+        run_command(
+            [
+                python,
+                str(SRC_DIR / "data_selector.py"),
+                "--dataset",
+                str(dataset_dir),
+                "--output",
+                str(selection_path),
+                "--start",
+                str(args.start_episode),
+            ]
+        )
+        return
+
+    if not selection_path.exists():
+        raise FileNotFoundError(f"找不到筛选记录：{selection_path}")
+
+    output_dir = dataset_dir.parent / f"{dataset_dir.name}_filtered"
+    print(f"筛选输出：{output_dir}")
     run_command(
         [
             python,
-            str(SRC_DIR / "data_selector.py"),
+            str(SRC_DIR / "apply_selection.py"),
             "--dataset",
             str(dataset_dir),
-            "--output",
+            "--selection",
             str(selection_path),
-            "--start",
-            str(args.start_episode),
+            "--output",
+            str(output_dir),
         ]
     )
 
